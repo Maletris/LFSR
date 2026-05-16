@@ -12,6 +12,61 @@ import os
 import h5py
 import argparse
 
+DEFAULT_DATA_RANGE = 255.0
+
+
+def resolve_data_range(reference=None, data_range="auto"):
+    """
+    Resolve the numeric intensity range used outside the network.
+    Network tensors should still be float32 in [0, 1].
+    """
+    if data_range is None or data_range == "auto":
+        if reference is not None:
+            dtype = np.asarray(reference).dtype
+            if np.issubdtype(dtype, np.integer):
+                return float(np.iinfo(dtype).max)
+            if np.issubdtype(dtype, np.floating):
+                finite_ref = np.asarray(reference)[np.isfinite(reference)]
+                if finite_ref.size and finite_ref.max() > 1.0:
+                    return float(finite_ref.max())
+        return DEFAULT_DATA_RANGE
+    return float(data_range)
+
+
+def resolve_result_dtype(reference=None, result_dtype="auto", data_range="auto"):
+    """Resolve output dtype for image-like arrays saved outside the network."""
+    if result_dtype is None or result_dtype == "auto":
+        if reference is not None:
+            dtype = np.asarray(reference).dtype
+            if np.issubdtype(dtype, np.integer):
+                return dtype
+        return np.uint16 if resolve_data_range(reference, data_range) > 255.0 else np.uint8
+    return np.dtype(result_dtype)
+
+
+def image_to_float01(img, data_range="auto"):
+    """Convert uint/float image data to float32 [0, 1] for the network."""
+    img = np.asarray(img)
+    if np.issubdtype(img.dtype, np.floating):
+        finite_img = img[np.isfinite(img)]
+        if finite_img.size == 0 or (finite_img.min() >= 0.0 and finite_img.max() <= 1.0):
+            return np.clip(img.astype(np.float32), 0.0, 1.0)
+    dr = resolve_data_range(img, data_range)
+    return np.clip(img.astype(np.float32) / dr, 0.0, 1.0)
+
+
+def float01_to_image(img, data_range="auto", result_dtype="auto", reference=None):
+    """Convert float [0, 1] network output back to an image dtype."""
+    dtype = resolve_result_dtype(reference, result_dtype, data_range)
+    if np.issubdtype(dtype, np.floating):
+        return np.clip(img, 0.0, 1.0).astype(dtype)
+    dr = resolve_data_range(reference, data_range)
+    max_value = float(np.iinfo(dtype).max)
+    scale = min(dr, max_value)
+    img = np.clip(np.asarray(img), 0.0, 1.0)
+    return np.round(img * scale).astype(dtype)
+
+
 def get_time_gpu():
     torch.cuda.synchronize()
     return time.time()
@@ -125,10 +180,10 @@ class bicubic_imresize(nn.Module):
         out = torch.sum(out, dim=3).permute(0, 1, 3, 2)
         return out
 #
-def LF_downscale(input_lf, scale):
+def LF_downscale(input_lf, scale, data_range="auto", result_dtype="auto"):
     """
     Downscale the input light field.
-    :param input_lf: [U,V,X,Y], dtype: uint8
+    :param input_lf: [U,V,X,Y], image-like dtype
     :param scale: should be larger than 1
     :return: resized light field
     """
@@ -139,15 +194,16 @@ def LF_downscale(input_lf, scale):
     w = W // scale
     resize = bicubic_imresize()
     input_lf = input_lf[:, :, :H, :W]
-    input_lf = torch.Tensor(input_lf.astype(np.float32) / 255.0).contiguous().view(1, -1, H, W)
+    input_ref = input_lf
+    input_lf_float = image_to_float01(input_lf, data_range)
+    input_lf = torch.Tensor(input_lf_float).contiguous().view(1, -1, H, W)
     resize_lf = resize(input_lf, 1.0/scale)  # [1, U*V, H/s, W/s]
     resize_lf = resize_lf.view(-1, U, h, w)
-    resize_lf = torch.round(resize_lf * 255.0)
-    resize_lf = torch.clamp(resize_lf, 0.0, 255.0)
-    resize_lf = resize_lf.numpy().astype(np.uint8)
+    resize_lf = resize_lf.numpy()
+    resize_lf = float01_to_image(resize_lf, data_range, result_dtype, reference=input_ref)
     return resize_lf
 
-def LF_downscale_RGB(input_lf, scale):
+def LF_downscale_RGB(input_lf, scale, data_range="auto", result_dtype="auto"):
     """
     LF_downscale with RGB light field.
     :param input_lf: [C,U,V,X,Y], dtype: uint8
@@ -161,12 +217,13 @@ def LF_downscale_RGB(input_lf, scale):
     w = W // scale
     resize = bicubic_imresize()
     input_lf = input_lf[:, :, :, :H, :W]
-    input_lf = torch.Tensor(input_lf.astype(np.float32) / 255.0).contiguous().view(1, -1, H, W)
+    input_ref = input_lf
+    input_lf_float = image_to_float01(input_lf, data_range)
+    input_lf = torch.Tensor(input_lf_float).contiguous().view(1, -1, H, W)
     resize_lf = resize(input_lf, 1.0/scale)  # [1, C*U*V, H/s, W/s]
     resize_lf = resize_lf.view(C, U, -1, h, w)
-    resize_lf = torch.round(resize_lf * 255.0)
-    resize_lf = torch.clamp(resize_lf, 0.0, 255.0)
-    resize_lf = resize_lf.numpy().astype(np.uint8)
+    resize_lf = resize_lf.numpy()
+    resize_lf = float01_to_image(resize_lf, data_range, result_dtype, reference=input_ref)
     return resize_lf
 
 def back_projection_refinement(lr_img, sr_res, scale):
@@ -182,11 +239,11 @@ def back_projection_refinement(lr_img, sr_res, scale):
     refined_res = sr_res + resizer(lr_img - resizer(sr_res, 1.0/scale), scale)
     return refined_res
 
-def PSNR(pred, gt, shave_border=0):
+def PSNR(pred, gt, shave_border=0, data_range="auto"):
     """
     PSNR function.
-    :param pred:            uint8, predicted result
-    :param gt:              uint8, ground truth
+    :param pred:            predicted result
+    :param gt:              ground truth
     :param shave_border:    int, crop the border to calculate PSNR
     :return: PSNR value in dB.
     """
@@ -199,7 +256,7 @@ def PSNR(pred, gt, shave_border=0):
     rmse = math.sqrt(np.mean(imdff ** 2))
     if rmse == 0:
         return 100
-    return 20 * math.log10(255.0 / rmse)
+    return 20 * math.log10(resolve_data_range(gt, data_range) / rmse)
 
 def transfer_img_to_uint8(img):
     """
@@ -211,6 +268,18 @@ def transfer_img_to_uint8(img):
     img = np.clip(img, 0.0, 255.0)
     img = np.uint8(np.around(img))
     return img
+
+def transfer_img_to_uint16(img):
+    """
+    Transfer float tensor within [0,1] to uint16.
+    """
+    return float01_to_image(img, data_range=65535.0, result_dtype=np.uint16)
+
+def transfer_img_to_dtype(img, data_range="auto", result_dtype="auto", reference=None):
+    """
+    Transfer float tensor within [0,1] to the requested image dtype.
+    """
+    return float01_to_image(img, data_range=data_range, result_dtype=result_dtype, reference=reference)
 
 def colorize(y, ycbcr):
     """
@@ -260,40 +329,44 @@ def lf_modcrop(lf, scale):
     [U, V, X, Y] = lf.shape
     x = X - (X % scale)
     y = Y - (Y % scale)
-    output = np.zeros([U, V, x, y])
+    output = np.zeros([U, V, x, y], dtype=lf.dtype)
     for u in range(0, U):
         for v in range(0, V):
             sub_img = lf[u,v]
             output[u,v] = modcrop(sub_img, scale)
     return output
 
-def single_image_downscale(hr_img, scale):
+def single_image_downscale(hr_img, scale, data_range="auto", result_dtype="auto"):
     """
-    Downscale a single uint8 image.
-    :param hr_img: [H, W], dtype: uint8
+    Downscale a single image.
+    :param hr_img: [H, W], image-like dtype
     :param scale: should be larger than 1.
     :return: downsampeld hr_img
     """
     hr_img = modcrop(hr_img, scale)
+    img_ref = hr_img
     resize = bicubic_imresize()
-    hr_img = torch.Tensor(hr_img.astype(np.float32) / 255.0).contiguous().unsqueeze(0).unsqueeze(0)
+    hr_float = image_to_float01(hr_img, data_range)
+    hr_img = torch.Tensor(hr_float).contiguous().unsqueeze(0).unsqueeze(0)
     lr_img = resize(hr_img, 1.0/scale)
-    lr_img = torch.clamp(torch.round(lr_img * 255.0), 0.0, 255.0)
-    lr_img = lr_img.squeeze().numpy().astype(np.uint8) # [h, w]
+    lr_img = lr_img.squeeze().numpy()
+    lr_img = float01_to_image(lr_img, data_range, result_dtype, reference=img_ref) # [h, w]
     return lr_img
 
-def single_image_upscale(lr_img, scale):
+def single_image_upscale(lr_img, scale, data_range="auto", result_dtype="auto"):
     """
-    Upscale a single uint8 image.
-    :param lr_img: [h, w], dtype: uint8
+    Upscale a single image.
+    :param lr_img: [h, w], image-like dtype
     :param scale: should be larger than 1.
     :return: upsampeld lr_img
     """
     resize = bicubic_imresize()
-    lr_img = torch.Tensor(lr_img.astype(np.float32) / 255.0).contiguous().unsqueeze(0).unsqueeze(0)
+    img_ref = lr_img
+    lr_float = image_to_float01(lr_img, data_range)
+    lr_img = torch.Tensor(lr_float).contiguous().unsqueeze(0).unsqueeze(0)
     hr_img = resize(lr_img, scale)
-    hr_img = torch.clamp(torch.round(hr_img * 255.0), 0.0, 255.0)
-    hr_img = hr_img.squeeze().numpy().astype(np.uint8) # [h, w]
+    hr_img = hr_img.squeeze().numpy()
+    hr_img = float01_to_image(hr_img, data_range, result_dtype, reference=img_ref) # [h, w]
     return hr_img
 
 def img_rgb2ycbcr(img):
@@ -637,4 +710,3 @@ def warp_to_central_view_lf(input_lf, disparity, padding_mode="zeros"):
             warped_central_view.append(warped_img)
     warped_central_view = torch.cat(warped_central_view, dim=1)
     return warped_central_view
-

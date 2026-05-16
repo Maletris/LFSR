@@ -78,9 +78,13 @@ for ind in range(opt.start, opt.end):
     hr_lf = loadmat(mat_path)["lf_hr"]
     # Use the configured center view position
     hr_cv = hr_lf[cv_uv, cv_uv]
-    lr_cv = single_image_downscale(hr_cv, opt.scale)
-    bic_lr_cv = single_image_upscale(lr_cv, opt.scale)
-    psnr_bicubic = PSNR(bic_lr_cv, hr_cv)
+    lr_cv = single_image_downscale(hr_cv, opt.scale,
+                                   data_range=configs.data_range,
+                                   result_dtype=configs.result_dtype)
+    bic_lr_cv = single_image_upscale(lr_cv, opt.scale,
+                                     data_range=configs.data_range,
+                                     result_dtype=configs.result_dtype)
+    psnr_bicubic = PSNR(bic_lr_cv, hr_cv, data_range=configs.data_range)
     print("Bicubic interpolation after crop: {}".format(psnr_bicubic))
 
     if lf_set_name == "HCI1":
@@ -107,4 +111,3 @@ for ind in range(opt.start, opt.end):
 if opt.record:
     sio.savemat("{}/{}.mat".format(save_prefix, save_name_dir),
                 {"PSNRs": PSNRs})
-

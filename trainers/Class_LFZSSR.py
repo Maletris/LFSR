@@ -66,6 +66,8 @@ class LFZSSR_SingleTargetView:
         self.view_num = self.conf.view_num
         self.refPos = self.conf.refPos
         self.level_num = self.conf.level_num
+        self.data_range = getattr(self.conf, "data_range", "auto")
+        self.result_dtype = getattr(self.conf, "result_dtype", "auto")
 
         # Set GPU device
         if self.conf.use_cuda:
@@ -80,21 +82,29 @@ class LFZSSR_SingleTargetView:
                                                                scale=self.scale,
                                                                view_num=self.view_num,
                                                                patch_size=self.conf.align_patch_size,
-                                                               batch_size=self.conf.align_batch_size)
+                                                               batch_size=self.conf.align_batch_size,
+                                                               data_range=self.data_range,
+                                                               result_dtype=self.result_dtype)
         self.dataloader_aggre = DataloaderForLFZSSRWithBatch(mat_path=mat_path,
                                                              refPos=self.refPos,
                                                              scale=self.scale,
                                                              view_num=self.view_num,
                                                              patch_size=self.patch_size,
                                                              batch_size=self.conf.aggre_batch_size,
-                                                             scale_aug=self.conf.scale_aug)
+                                                             scale_aug=self.conf.scale_aug,
+                                                             data_range=self.data_range,
+                                                             result_dtype=self.result_dtype)
         self.dataloader_ft = DataloaderForLFZSSRWithBatch(mat_path=mat_path,
                                                        refPos=self.refPos,
                                                        scale=self.scale,
                                                        view_num=self.view_num,
                                                        patch_size=self.patch_size,
                                                        batch_size=self.conf.ft_batch_size,
-                                                       scale_aug=False)
+                                                       scale_aug=False,
+                                                       data_range=self.data_range,
+                                                       result_dtype=self.result_dtype)
+        self.data_range = self.dataloader_aggre.data_range
+        self.result_dtype = self.dataloader_aggre.result_dtype
         # Record
         if self.conf.record:
             # writer
@@ -123,12 +133,22 @@ class LFZSSR_SingleTargetView:
                                                  level_num=self.level_num,
                                                  level_step=2.0 * self.conf.disp_max / (self.level_num - 1),
                                                  pad_size=self.conf.pad_size,
-                                                 view_num=self.conf.view_num)
+                                                 view_num=self.conf.view_num,
+                                                 aggre_confidence_enable=self.conf.aggre_confidence_enable,
+                                                 aggre_confidence_alpha=self.conf.aggre_confidence_alpha,
+                                                 aggre_confidence_min=self.conf.aggre_confidence_min,
+                                                 aggre_angular_weight_enable=self.conf.aggre_angular_weight_enable,
+                                                 aggre_angular_weight_beta=self.conf.aggre_angular_weight_beta)
         self.align_aggre_net_test = AlignWithAggreNet_ForTest(refPos=self.refPos, scale=self.scale,
                                                               level_num=self.level_num,
                                                               level_step=2.0 * self.conf.disp_max / (self.level_num - 1),
                                                               pad_size=self.conf.pad_size,
-                                                              view_num=self.conf.view_num)
+                                                              view_num=self.conf.view_num,
+                                                              aggre_confidence_enable=self.conf.aggre_confidence_enable,
+                                                              aggre_confidence_alpha=self.conf.aggre_confidence_alpha,
+                                                              aggre_confidence_min=self.conf.aggre_confidence_min,
+                                                              aggre_angular_weight_enable=self.conf.aggre_angular_weight_enable,
+                                                              aggre_angular_weight_beta=self.conf.aggre_angular_weight_beta)
 
         self.VDSR_model = torch.load(self.conf.vdsr_model_path)
 
@@ -164,6 +184,17 @@ class LFZSSR_SingleTargetView:
                                        lr=self.lr_ft_stage,
                                        weight_decay=self.conf.weight_decay)
 
+    def _to_float01(self, img):
+        return image_to_float01(img, self.data_range)
+
+    def _to_result_image(self, img, reference=None):
+        return transfer_img_to_dtype(img,
+                                     data_range=self.data_range,
+                                     result_dtype=self.result_dtype,
+                                     reference=reference)
+
+    def _psnr(self, pred, gt):
+        return PSNR(pred, gt, data_range=self.data_range)
 
     def back_projection_loss(self, sr_ref, lr_lf):
         # sr_cv: [B, 1, sH, sW]
@@ -176,9 +207,63 @@ class LFZSSR_SingleTargetView:
 
     def align_loss(self, warped_ref, gt_ref):
         gt_ref = gt_ref.repeat(1, warped_ref.shape[1], 1, 1)
-        warp_loss = self.L2criterion_sum(gt_ref, warped_ref) / \
-                    (warped_ref.shape[0] * warped_ref.shape[1] * warped_ref.shape[2] * warped_ref.shape[3])
-        return warp_loss
+        residual = warped_ref - gt_ref
+        abs_residual = torch.abs(residual)
+        loss_type = getattr(self.conf, "align_loss_type", "charbonnier").lower()
+
+        if loss_type == "charbonnier":
+            eps = getattr(self.conf, "charbonnier_eps", 1e-3)
+            per_pixel_loss = torch.sqrt(residual * residual + eps * eps) - eps
+        elif loss_type == "huber":
+            delta = getattr(self.conf, "huber_delta", 1e-2)
+            per_pixel_loss = torch.where(abs_residual <= delta,
+                                         0.5 * residual * residual / delta,
+                                         abs_residual - 0.5 * delta)
+        elif loss_type == "mse":
+            per_pixel_loss = residual * residual
+        else:
+            raise Exception("Wrong align_loss_type: {}".format(loss_type))
+
+        alpha = getattr(self.conf, "residual_weight_alpha", 0.0)
+        min_weight = getattr(self.conf, "residual_weight_min", 1.0)
+        if alpha > 0:
+            residual_weight = torch.exp(-alpha * abs_residual.detach())
+            residual_weight = torch.clamp(residual_weight, min=min_weight, max=1.0)
+            per_pixel_loss = per_pixel_loss * residual_weight
+        return torch.mean(per_pixel_loss)
+
+    def _center_view(self, lf_tensor):
+        # lf_tensor: [B, U*V, H, W]
+        center_idx = self.refPos[0] * self.view_num + self.refPos[1]
+        return lf_tensor[:, center_idx:center_idx + 1, :, :]
+
+    def _edge_weight(self, guide):
+        edge_alpha = getattr(self.conf, "edge_weight_alpha", 10.0)
+        if edge_alpha <= 0:
+            return torch.ones_like(guide)
+        grad_mag = torch.zeros_like(guide)
+        grad_mag[:, :, :, 1:] += torch.abs(guide[:, :, :, 1:] - guide[:, :, :, :-1])
+        grad_mag[:, :, 1:, :] += torch.abs(guide[:, :, 1:, :] - guide[:, :, :-1, :])
+        return torch.exp(-edge_alpha * grad_mag.detach())
+
+    def disparity_hessian_loss(self, lr_disp, lf_input):
+        # lr_disp: [B, 1, h, w], lf_input: [B, U*V, h, w]
+        if getattr(self.conf, "disp_hessian_weight", 0.0) <= 0:
+            return lr_disp.sum() * 0.0
+        if lr_disp.shape[2] < 3 or lr_disp.shape[3] < 3:
+            return lr_disp.sum() * 0.0
+
+        edge_weight = self._edge_weight(self._center_view(lf_input))
+        dxx = lr_disp[:, :, :, 2:] - 2.0 * lr_disp[:, :, :, 1:-1] + lr_disp[:, :, :, :-2]
+        dyy = lr_disp[:, :, 2:, :] - 2.0 * lr_disp[:, :, 1:-1, :] + lr_disp[:, :, :-2, :]
+        dxy = lr_disp[:, :, 1:, 1:] - lr_disp[:, :, 1:, :-1] - lr_disp[:, :, :-1, 1:] + lr_disp[:, :, :-1, :-1]
+
+        wx = edge_weight[:, :, :, 1:-1]
+        wy = edge_weight[:, :, 1:-1, :]
+        wxy = 0.25 * (edge_weight[:, :, 1:, 1:] + edge_weight[:, :, 1:, :-1] +
+                      edge_weight[:, :, :-1, 1:] + edge_weight[:, :, :-1, :-1])
+        return torch.mean(wx * torch.abs(dxx)) + torch.mean(wy * torch.abs(dyy)) + \
+            2.0 * torch.mean(wxy * torch.abs(dxy))
 
     def early_stop(self, lr):
         # if lr is smaller than the min_lr, return an early stop signal
@@ -201,7 +286,7 @@ class LFZSSR_SingleTargetView:
         # get the central light fields
         view_start = (U - self.view_num) // 2
         lr_lf = lr_lf[view_start: view_start+self.view_num, view_start: view_start+self.view_num]
-        lr_lf = lr_lf.astype(float) / 255.0
+        lr_lf = self._to_float01(lr_lf)
         lr_lf = torch.Tensor(lr_lf).float().view(1, -1, lr_lf.shape[2], lr_lf.shape[3])
         # feed into devices
         if self.conf.use_cuda:
@@ -238,13 +323,13 @@ class LFZSSR_SingleTargetView:
         if self.align_iter == 0:
             vdsr_cv = vdsr_cv[:, 0, :, :].squeeze()
             vdsr_cv = vdsr_cv.cpu().data.numpy()
-            vdsr_cv = transfer_img_to_uint8(vdsr_cv)
+            vdsr_cv = self._to_result_image(vdsr_cv, reference=hr_ref_view)
             self.vdsr_ref = vdsr_cv
             H, W = hr_ref_view.shape
             H = H - H % self.scale
             W = W - W % self.scale
             hr_ref_view = hr_ref_view[:H, :W]
-            self.vdsr_PSNR = PSNR(self.vdsr_ref, hr_ref_view)
+            self.vdsr_PSNR = self._psnr(self.vdsr_ref, hr_ref_view)
             print("VDSR PSNR is :{:.4f}".format(self.vdsr_PSNR))
         return test_mse
 
@@ -261,7 +346,7 @@ class LFZSSR_SingleTargetView:
         hr_lf = hr_lf[view_start: view_start + self.view_num, view_start: view_start + self.view_num]
         hr_ref_view = hr_lf[self.refPos[0], self.refPos[1]] # [H, W]
         # transfer lr_lf into tensor
-        lr_lf = lr_lf.astype(float) / 255.0
+        lr_lf = self._to_float01(lr_lf)
         lr_lf = torch.Tensor(lr_lf).float().view(1, -1, lr_lf.shape[2], lr_lf.shape[3])
         # feed into devices
         if self.conf.use_cuda:
@@ -293,8 +378,8 @@ class LFZSSR_SingleTargetView:
         sr_res = sr_res.squeeze()
         sr_res = sr_res.numpy().astype(np.float32)
 
-        sr_res = transfer_img_to_uint8(sr_res)
-        PSNR_value = PSNR(sr_res, hr_ref_view)
+        sr_res = self._to_result_image(sr_res, reference=hr_ref_view)
+        PSNR_value = self._psnr(sr_res, hr_ref_view)
 
         # display
         print("Testing PSNR is: {:.4f}".format(PSNR_value))
@@ -351,18 +436,25 @@ class LFZSSR_SingleTargetView:
 
             # backward
             align_loss = self.align_loss(aligned_vdsr_lf, vdsr_cv)
-            align_loss.backward()
+            disp_hessian_loss = self.disparity_hessian_loss(lr_disp, lf_patch)
+            total_align_loss = align_loss + self.conf.disp_hessian_weight * disp_hessian_loss
+            total_align_loss.backward()
             self.align_optimizer.step()
 
             # record
             if self.conf.record:
                 self.writer.add_scalar("scalar_align_stage/align_loss", align_loss.cpu().data, self.align_iter)
+                self.writer.add_scalar("scalar_align_stage/disp_hessian_loss", disp_hessian_loss.cpu().data, self.align_iter)
+                self.writer.add_scalar("scalar_align_stage/total_align_loss", total_align_loss.cpu().data, self.align_iter)
             # display
             if (self.align_iter % self.conf.display_loss_step == 0):
-                print("===> {}: Iteration: {}, lr: {:.5f}, Warp loss: {:.10f}".
+                print("===> {}: Iteration: {}, lr: {:.5f}, Warp loss: {:.10f}, "
+                      "Disp Hessian loss: {:.10f}, Total loss: {:.10f}".
                       format(get_cur_time(), self.align_iter,
                              self.align_optimizer.param_groups[0]["lr"],
-                             align_loss.cpu().data))
+                             align_loss.cpu().data,
+                             disp_hessian_loss.cpu().data,
+                             total_align_loss.cpu().data))
            
             if self.align_iter % 8000 == 0 and self.align_iter < 16000:
                 self.lr_align_stage *= 0.1
@@ -516,6 +608,7 @@ class LFZSSR_SingleTargetView:
             # backward
             # for WarpNet
             align_lr_loss = self.align_loss(warped_vdsr_lf, vdsr_ref)
+            disp_hessian_loss = self.disparity_hessian_loss(lr_disp, lr_patch)
 
             # for FusionNet
             if self.conf.zssr_bp_ratio > 0.0:
@@ -534,7 +627,9 @@ class LFZSSR_SingleTargetView:
             else:
                 bp_loss = 0.0
             sr_loss = self.L1criterion(ref_sr_res, hr_ref_patch)
-            total_loss = sr_loss + align_lr_loss * self.conf.align_loss_weight + bp_loss * self.conf.zssr_bp_ratio
+            total_loss = sr_loss + align_lr_loss * self.conf.align_loss_weight + \
+                         bp_loss * self.conf.zssr_bp_ratio + \
+                         disp_hessian_loss * self.conf.disp_hessian_weight
             total_loss.backward()
             self.ft_optimizer.step()
 
@@ -542,6 +637,7 @@ class LFZSSR_SingleTargetView:
             if self.conf.record:
                 self.writer.add_scalar("scalar_ft_stage/SR_loss", sr_loss.cpu().data, self.ft_iter)
                 self.writer.add_scalar("scalar_ft_stage/Align_lr_loss", align_lr_loss.cpu().data, self.ft_iter)
+                self.writer.add_scalar("scalar_ft_stage/Disp_hessian_loss", disp_hessian_loss.cpu().data, self.ft_iter)
                 if self.conf.zssr_bp_ratio > 0.0:
                     self.writer.add_scalar("scalar_ft_stage/BP_loss", bp_loss.cpu().data, self.ft_iter)
                 self.writer.add_scalar("scalar_ft_stage/Total_loss", total_loss.cpu().data, self.ft_iter)
@@ -550,20 +646,22 @@ class LFZSSR_SingleTargetView:
                 if self.conf.zssr_bp_ratio > 0.0:
                     print(
                         "===> {}: Iteration: {}, lr: {:.6f}, SR loss: {:.10f}, BP loss: {:.10f}, "
-                        "Align LR loss: {:.10f}, Total loss: {:.10f}".
+                        "Align LR loss: {:.10f}, Disp Hessian loss: {:.10f}, Total loss: {:.10f}".
                             format(get_cur_time(), self.ft_iter,
                                    self.ft_optimizer.param_groups[0]["lr"],
                                    sr_loss.cpu().data,
                                    bp_loss.cpu().data,
                                    align_lr_loss.cpu().data,
+                                   disp_hessian_loss.cpu().data,
                                    total_loss.cpu().data))
                 else:
                     print("===> {}: Iteration: {}, lr: {:.5f}, SR loss: {:.10f}, "
-                          "Align LR loss: {:.10f}, Total loss: {:.10f}".
+                          "Align LR loss: {:.10f}, Disp Hessian loss: {:.10f}, Total loss: {:.10f}".
                           format(get_cur_time(), self.ft_iter,
                                  self.ft_optimizer.param_groups[0]["lr"],
                                  sr_loss.cpu().data,
                                  align_lr_loss.cpu().data,
+                                 disp_hessian_loss.cpu().data,
                                  total_loss.cpu().data))
 
 
@@ -626,7 +724,7 @@ class LFZSSR_SingleTargetView:
                 test_input_lf = np.rot90(test_input_lf, k - 12, (0, 1))
 
             # start test
-            test_input_lf = test_input_lf.astype(float) / 255.0
+            test_input_lf = self._to_float01(test_input_lf)
             test_input_lf = torch.Tensor(test_input_lf.copy()).float().view(1, -1,
                                                                             test_input_lf.shape[2],
                                                                             test_input_lf.shape[3])
@@ -670,7 +768,7 @@ class LFZSSR_SingleTargetView:
 
             # BP refinement
             t_tmp_output = torch.Tensor(tmp_output.copy()).unsqueeze(0).unsqueeze(0)
-            t_lr_cv = torch.Tensor(lr_ref.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
+            t_lr_cv = torch.Tensor(self._to_float01(lr_ref)).unsqueeze(0).unsqueeze(0)
             if self.conf.use_cuda:
                 t_tmp_output = t_tmp_output.cuda()
                 t_lr_cv = t_lr_cv.cuda()
@@ -680,24 +778,24 @@ class LFZSSR_SingleTargetView:
             t_tmp_output = t_tmp_output.squeeze().cpu().data.numpy().astype(np.float32)
             outputs.append(t_tmp_output)
         almost_final_sr = np.median(outputs, 0)
-        almost_final_sr = transfer_img_to_uint8(almost_final_sr)
+        almost_final_sr = self._to_result_image(almost_final_sr, reference=hr_ref)
 
         ##### ----- Final back-projection refinement
-        t_almost_final = torch.Tensor(almost_final_sr.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
-        t_lr_cv = torch.Tensor(lr_ref.astype(np.float32) / 255.0).unsqueeze(0).unsqueeze(0)
+        t_almost_final = torch.Tensor(self._to_float01(almost_final_sr)).unsqueeze(0).unsqueeze(0)
+        t_lr_cv = torch.Tensor(self._to_float01(lr_ref)).unsqueeze(0).unsqueeze(0)
         if self.conf.use_cuda:
             t_almost_final = t_almost_final.cuda()
             t_lr_cv = t_lr_cv.cuda()
         for _ in range(self.conf.max_bp_iter):
             t_almost_final = back_projection_refinement(t_lr_cv, t_almost_final, self.scale)
 
-        # back to numpy and [0, 255]
+        # back to numpy and configured image dtype
         t_almost_final = t_almost_final.squeeze().cpu().data.numpy().astype(np.float32)
-        final_res = transfer_img_to_uint8(t_almost_final)
+        final_res = self._to_result_image(t_almost_final, reference=hr_ref)
 
         # calculate PSNR
-        psnr_ensemble = PSNR(almost_final_sr, hr_ref)
-        psnr_final = PSNR(final_res, hr_ref)
+        psnr_ensemble = self._psnr(almost_final_sr, hr_ref)
+        psnr_final = self._psnr(final_res, hr_ref)
 
         return psnr_ensemble, psnr_final, almost_final_sr, final_res
 
@@ -881,15 +979,18 @@ class LFZSSR_MultiTargetView:
         # 获取第一个结果的图像尺寸
         first_result = list(self.all_results.values())[0]
         H, W = first_result["aggre_final_res"].shape
+        result_dtype = resolve_result_dtype(first_result["aggre_final_res"],
+                                            getattr(self.conf, "result_dtype", "auto"),
+                                            getattr(self.conf, "data_range", "auto"))
         
         # 初始化 4D 矩阵 [U, V, H, W]
-        sr_aggre_sr = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=np.uint8)
-        sr_aggre_ensemble = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=np.uint8)
-        sr_aggre_final = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=np.uint8)
-        sr_ft_sr = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=np.uint8)
-        sr_ft_ensemble = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=np.uint8)
-        sr_ft_final = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=np.uint8)
-        vdsr_refs = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=np.uint8)
+        sr_aggre_sr = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=result_dtype)
+        sr_aggre_ensemble = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=result_dtype)
+        sr_aggre_final = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=result_dtype)
+        sr_ft_sr = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=result_dtype)
+        sr_ft_ensemble = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=result_dtype)
+        sr_ft_final = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=result_dtype)
+        vdsr_refs = np.zeros((self.target_view_range, self.target_view_range, H, W), dtype=result_dtype)
         
         # PSNR 矩阵 [U, V]
         psnr_aggre_sr = np.zeros((self.target_view_range, self.target_view_range))

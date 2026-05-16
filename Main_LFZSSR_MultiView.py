@@ -138,9 +138,13 @@ for ind in range(opt.start, opt.end):
         lf_size = hr_lf.shape[0]  # Assuming square angular resolution
         center_idx = lf_size // 2
         hr_cv = hr_lf[center_idx, center_idx]
-        lr_cv = single_image_downscale(hr_cv, opt.scale)
-        bic_lr_cv = single_image_upscale(lr_cv, opt.scale)
-        psnr_bicubic = PSNR(bic_lr_cv, hr_cv)
+        lr_cv = single_image_downscale(hr_cv, opt.scale,
+                                       data_range=configs.data_range,
+                                       result_dtype=configs.result_dtype)
+        bic_lr_cv = single_image_upscale(lr_cv, opt.scale,
+                                         data_range=configs.data_range,
+                                         result_dtype=configs.result_dtype)
+        psnr_bicubic = PSNR(bic_lr_cv, hr_cv, data_range=configs.data_range)
         print(f"Bicubic interpolation baseline PSNR: {psnr_bicubic:.4f} dB (center view [{center_idx}, {center_idx}])\n")
     except Exception as e:
         print(f"Warning: Cannot calculate Bicubic baseline: {e}")

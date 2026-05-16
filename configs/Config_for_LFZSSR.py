@@ -15,6 +15,8 @@ class Config:
     align_batch_size = 1
     ft_batch_size = 1
     random_seed = None
+    data_range = "auto"  # infer 255/65535 from input dtype, or set a number explicitly
+    result_dtype = "auto"  # infer from input dtype, or set "uint8"/"uint16"
 
     ######## devices
     use_cuda = True
@@ -42,6 +44,13 @@ class Config:
     # For AlignNet
     disp_max = 2.0
     level_num = 64
+    align_loss_type = "charbonnier"  # "charbonnier", "huber", or "mse"
+    charbonnier_eps = 1e-3
+    huber_delta = 1e-2
+    residual_weight_alpha = 10.0
+    residual_weight_min = 0.1
+    disp_hessian_weight = 1e-3
+    edge_weight_alpha = 10.0
 
     # For finetune
     align_loss_weight = 0.1
@@ -58,5 +67,9 @@ class Config:
     align_aggre_iter_step = 3000
     ft_iter_step = 2500
 
-
-
+    # For AggreNet confidence weighting before fusion
+    aggre_confidence_enable = True
+    aggre_confidence_alpha = 10.0
+    aggre_confidence_min = 0.1
+    aggre_angular_weight_enable = False
+    aggre_angular_weight_beta = 0.1

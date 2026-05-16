@@ -344,7 +344,12 @@ class AlignWithAggreNet(nn.Module):
                  level_num=100,
                  level_step=0.1,
                  pad_size=12,
-                 view_num=9):
+                 view_num=9,
+                 aggre_confidence_enable=False,
+                 aggre_confidence_alpha=10.0,
+                 aggre_confidence_min=0.1,
+                 aggre_angular_weight_enable=False,
+                 aggre_angular_weight_beta=0.1):
         super(AlignWithAggreNet, self).__init__()
 
         print("Current network is the original shallow one")
@@ -356,6 +361,11 @@ class AlignWithAggreNet(nn.Module):
         self.scale = scale
         self.padding_mode = padding_mode
         self.pad_size = pad_size
+        self.aggre_confidence_enable = aggre_confidence_enable
+        self.aggre_confidence_alpha = aggre_confidence_alpha
+        self.aggre_confidence_min = aggre_confidence_min
+        self.aggre_angular_weight_enable = aggre_angular_weight_enable
+        self.aggre_angular_weight_beta = aggre_angular_weight_beta
         self.padder = nn.ReflectionPad2d(self.pad_size)
         # used modules: imresizer and relu
         self.relu = nn.ReLU(inplace=True)
@@ -460,6 +470,31 @@ class AlignWithAggreNet(nn.Module):
         for m in self.output.parameters():
             m.requires_grad = False
 
+    def angular_weight(self, ref_tensor):
+        if not self.aggre_angular_weight_enable:
+            return None
+        distances = []
+        for u in range(self.view_num):
+            for v in range(self.view_num):
+                du = float(u - self.refPos[0])
+                dv = float(v - self.refPos[1])
+                distances.append((du * du + dv * dv) ** 0.5)
+        distances = torch.Tensor(distances).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        return torch.exp(-self.aggre_angular_weight_beta * distances).view(1, -1, 1, 1)
+
+    def apply_aggre_confidence(self, aligned_vdsr_lf, vdsr_ref):
+        weight = None
+        if self.aggre_confidence_enable:
+            residual = torch.abs(aligned_vdsr_lf - vdsr_ref)
+            weight = torch.exp(-self.aggre_confidence_alpha * residual.detach())
+            weight = torch.clamp(weight, min=self.aggre_confidence_min, max=1.0)
+        angular_weight = self.angular_weight(aligned_vdsr_lf)
+        if angular_weight is not None:
+            weight = angular_weight if weight is None else weight * angular_weight
+        if weight is None:
+            return aligned_vdsr_lf
+        return aligned_vdsr_lf * weight
+
     def forward(self, lf_input, aug_scale, range_angular,
                 range_spatial_x_lr_pad,
                 range_spatial_y_lr_pad,
@@ -522,7 +557,8 @@ class AlignWithAggreNet(nn.Module):
         aligned_vdsr_lf = aligned_vdsr_lf[:, :, self.pad_size:-self.pad_size,
                         self.pad_size:-self.pad_size]
         ### --- Final finally, Fusion
-        feat = self.relu(self.fusion_conv1(aligned_vdsr_lf))
+        fusion_input = self.apply_aggre_confidence(aligned_vdsr_lf, vdsr_ref)
+        feat = self.relu(self.fusion_conv1(fusion_input))
         feat = self.relu(self.fusion_conv2(feat))
         feat = self.relu(self.fusion_conv3(feat))
         feat = self.relu(self.fusion_conv4(feat))
@@ -539,7 +575,12 @@ class AlignWithAggreNet_ForTest(nn.Module):
                  level_num=100,
                  level_step=0.1,
                  pad_size=12,
-                 view_num=9):
+                 view_num=9,
+                 aggre_confidence_enable=False,
+                 aggre_confidence_alpha=10.0,
+                 aggre_confidence_min=0.1,
+                 aggre_angular_weight_enable=False,
+                 aggre_angular_weight_beta=0.1):
         super(AlignWithAggreNet_ForTest, self).__init__()
 
         self.refPos = refPos
@@ -549,6 +590,11 @@ class AlignWithAggreNet_ForTest(nn.Module):
         self.scale = scale
         self.padding_mode = padding_mode
         self.pad_size = pad_size
+        self.aggre_confidence_enable = aggre_confidence_enable
+        self.aggre_confidence_alpha = aggre_confidence_alpha
+        self.aggre_confidence_min = aggre_confidence_min
+        self.aggre_angular_weight_enable = aggre_angular_weight_enable
+        self.aggre_angular_weight_beta = aggre_angular_weight_beta
         self.padder = nn.ReflectionPad2d(self.pad_size)
         # used modules: imresizer and relu
         self.relu = nn.ReLU(inplace=True)
@@ -601,6 +647,31 @@ class AlignWithAggreNet_ForTest(nn.Module):
         for _ in range(num_of_layer):
             layers.append(block())
         return nn.Sequential(*layers)
+
+    def angular_weight(self, ref_tensor):
+        if not self.aggre_angular_weight_enable:
+            return None
+        distances = []
+        for u in range(self.view_num):
+            for v in range(self.view_num):
+                du = float(u - self.refPos[0])
+                dv = float(v - self.refPos[1])
+                distances.append((du * du + dv * dv) ** 0.5)
+        distances = torch.Tensor(distances).to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+        return torch.exp(-self.aggre_angular_weight_beta * distances).view(1, -1, 1, 1)
+
+    def apply_aggre_confidence(self, aligned_vdsr_lf, vdsr_ref):
+        weight = None
+        if self.aggre_confidence_enable:
+            residual = torch.abs(aligned_vdsr_lf - vdsr_ref)
+            weight = torch.exp(-self.aggre_confidence_alpha * residual.detach())
+            weight = torch.clamp(weight, min=self.aggre_confidence_min, max=1.0)
+        angular_weight = self.angular_weight(aligned_vdsr_lf)
+        if angular_weight is not None:
+            weight = angular_weight if weight is None else weight * angular_weight
+        if weight is None:
+            return aligned_vdsr_lf
+        return aligned_vdsr_lf * weight
 
     def PSV_generator(self, input_lf, aug_scale):
         input_lf = self.padder(input_lf)
@@ -685,7 +756,8 @@ class AlignWithAggreNet_ForTest(nn.Module):
         aligned_vdsr_lf = aligned_vdsr_lf[:, :, self.pad_size:-self.pad_size,
                         self.pad_size:-self.pad_size]
         ### --- Final finally, Fusion
-        feat = self.relu(self.fusion_conv1(aligned_vdsr_lf))
+        fusion_input = self.apply_aggre_confidence(aligned_vdsr_lf, vdsr_ref)
+        feat = self.relu(self.fusion_conv1(fusion_input))
         feat = self.relu(self.fusion_conv2(feat))
         feat = self.relu(self.fusion_conv3(feat))
         feat = self.relu(self.fusion_conv4(feat))

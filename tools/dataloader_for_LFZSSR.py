@@ -25,13 +25,19 @@ class DataloaderForLFZSSRWithBatch:
                  patch_size=64,
                  batch_size=1,
                  scale_aug=True,
+                 data_range="auto",
+                 result_dtype="auto",
                  random_flip_vertical=True,
                  random_flip_horizontal=True,
                  random_rotation=True):
         # read the data first
         self.mat_data = loadmat(mat_path)
         self.lf_hr = self.mat_data['lf_hr']
-        self.lf_lr = LF_downscale(self.lf_hr, scale)
+        self.data_range = resolve_data_range(self.lf_hr, data_range)
+        self.result_dtype = resolve_result_dtype(self.lf_hr, result_dtype, self.data_range)
+        self.lf_lr = LF_downscale(self.lf_hr, scale,
+                                  data_range=self.data_range,
+                                  result_dtype=self.result_dtype)
         # scale factor for super-resolution
         self.scale = scale
         self.refPos = refPos
@@ -64,7 +70,7 @@ class DataloaderForLFZSSRWithBatch:
         lf_lr = self.lf_lr[view_start: view_start + self.view_num, view_start: view_start + self.view_num]
 
         # get the HR father
-        hr_father = torch.Tensor(lf_lr.astype(np.float32) / 255.0).contiguous().view(1, -1, self.lr_height, self.lr_width)
+        hr_father = torch.Tensor(image_to_float01(lf_lr, self.data_range)).contiguous().view(1, -1, self.lr_height, self.lr_width)
         # init aug scale
         aug_scale = 1.0
 
@@ -165,13 +171,19 @@ class DataloaderForAlignNetWithBatch:
                  view_num,
                  patch_size=64,
                  batch_size=1,
+                 data_range="auto",
+                 result_dtype="auto",
                  random_flip_vertical=True,
                  random_flip_horizontal=True,
                  random_rotation=True):
         # read the data first
         self.mat_data = loadmat(mat_path)
         self.lf_hr = self.mat_data['lf_hr']
-        self.lf_lr = LF_downscale(self.lf_hr, scale)
+        self.data_range = resolve_data_range(self.lf_hr, data_range)
+        self.result_dtype = resolve_result_dtype(self.lf_hr, result_dtype, self.data_range)
+        self.lf_lr = LF_downscale(self.lf_hr, scale,
+                                  data_range=self.data_range,
+                                  result_dtype=self.result_dtype)
         # scale factor for super-resolution
         self.refPos = refPos
         # the processed view number
@@ -192,7 +204,7 @@ class DataloaderForAlignNetWithBatch:
         # get the wanted views
         view_start = (self.ori_view_num - self.view_num) // 2
         lf_lr = self.lf_lr[view_start: view_start + self.view_num, view_start: view_start + self.view_num]
-        lf_lr = lf_lr.astype(np.float32) / 255.0
+        lf_lr = image_to_float01(lf_lr, self.data_range)
 
         lf_patch = np.zeros([self.batch_size, self.view_num, self.view_num,
                              self.patch_size, self.patch_size], dtype=np.float32)
